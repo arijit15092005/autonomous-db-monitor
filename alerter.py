@@ -8,10 +8,20 @@ class AlertDispatcher:
     def __init__(self, webhook_url: str = None):
         self.webhook_url = (webhook_url or os.getenv("ALERT_WEBHOOK_URL", "")).strip()
 
-    def _get_anomaly_columns(self, conn, cursor):
-        """Return anomaly_logs columns for PostgreSQL or SQLite without extra imports."""
-        is_postgres = "psycopg" in type(conn).__module__.lower() or "psycopg" in type(cursor).__module__.lower()
-        if is_postgres:
+    def _is_postgres(self) -> bool:
+        if os.getenv("DATABASE_URL", "").strip().startswith("postgres"):
+            return True
+        try:
+            import streamlit as st
+            if "DATABASE_URL" in st.secrets:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _get_anomaly_columns(self, cursor):
+        """Return anomaly_logs column names cleanly for PostgreSQL or SQLite."""
+        if self._is_postgres():
             cursor.execute(
                 """
                 SELECT column_name
@@ -30,7 +40,7 @@ class AlertDispatcher:
 
         conn = get_connection()
         cursor = conn.cursor()
-        existing_cols = self._get_anomaly_columns(conn, cursor)
+        existing_cols = self._get_anomaly_columns(cursor)
         saved_count = 0
 
         for item in anomalies:
