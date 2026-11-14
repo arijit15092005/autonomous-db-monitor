@@ -1,5 +1,4 @@
 import time
-import sqlite3
 import pandas as pd
 from datetime import datetime
 from init_db import get_connection, init_database
@@ -7,7 +6,7 @@ from detector import AnomalyDetector
 from alerter import AlertDispatcher
 from traffic_generator import execute_real_db_query
 
-POLL_INTERVAL_SECONDS = 5
+POLL_INTERVAL_SECONDS = 10
 WINDOW_SIZE = 25
 Z_THRESHOLD = 2.8
 
@@ -47,30 +46,25 @@ def run_agent(auto_probe_db: bool = True):
 
     last_processed_id = get_last_processed_id()
     print(f"[Agent] Started Autonomous Monitoring Agent (resuming from ID > {last_processed_id})")
-    print(f"[Agent] Polling interval: {POLL_INTERVAL_SECONDS}s | Z-Threshold: {Z_THRESHOLD}")
 
     try:
         while True:
             try:
-                # 1. Perform genuine SQL health probe so real DB metrics are continuously gathered
                 if auto_probe_db:
                     execute_real_db_query(simulate_heavy_load=False)
 
-                # 2. Fetch rolling window + all newly arrived transactions
                 conn = get_connection()
                 recent_df = pd.read_sql_query(
                     f"""
                     SELECT * FROM api_transactions
                     ORDER BY id DESC LIMIT {WINDOW_SIZE + 50}
                     """,
-                    conn,
+                    conn.raw_conn,
                 )
 
                 if not recent_df.empty:
                     recent_df = recent_df.sort_values("id").reset_index(drop=True)
                     evaluated_df = detector.evaluate_transactions(recent_df, "response_time_ms")
-
-                    # Filter strictly to transactions not yet processed
                     new_rows = evaluated_df[evaluated_df["id"] > last_processed_id]
 
                     if not new_rows.empty:
@@ -93,22 +87,20 @@ def run_agent(auto_probe_db: bool = True):
                         last_processed_id = int(new_rows["id"].max())
                         print(
                             f"[{datetime.now().strftime('%H:%M:%S')}] Processed {len(new_rows)} tx(s) | "
-                            f"Latest ID: {last_processed_id} | Anomalies in batch: {len(anomalies)}"
+                            f"Latest ID: {last_processed_id} | Anomalies: {len(anomalies)}"
                         )
 
                 conn.close()
                 update_heartbeat("ONLINE", last_processed_id)
 
-            except sqlite3.OperationalError as db_err:
-                print(f"[Warning] Temporary DB lock/connection issue, retrying safely: {db_err}")
             except Exception as loop_err:
-                print(f"[Error] Monitoring cycle error: {loop_err}")
+                print(f"[Warning] Temporary DB/loop issue, retrying safely: {loop_err}")
 
             time.sleep(POLL_INTERVAL_SECONDS)
 
     except KeyboardInterrupt:
         update_heartbeat("OFFLINE", last_processed_id)
-        print("\n[Agent] Stopped cleanly by user. Heartbeat set to OFFLINE.")
+        print("\n[Agent] Stopped cleanly by user.")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ import time
 import pandas as pd
 import streamlit as st
 from datetime import datetime
-from init_db import get_connection, init_database
+from init_db import get_connection, init_database, is_postgres
 from detector import AnomalyDetector
 from alerter import AlertDispatcher
 from traffic_generator import execute_real_db_query, inject_simulated_spike
@@ -13,26 +13,25 @@ st.set_page_config(
     layout="wide",
 )
 
-# Ensure database schema exists safely on startup
 init_database()
 
 
 def fetch_dashboard_data(limit: int = 150):
     conn = get_connection()
     tx_df = pd.read_sql_query(
-        f"SELECT * FROM api_transactions ORDER BY id DESC LIMIT {limit}", conn
+        f"SELECT * FROM api_transactions ORDER BY id DESC LIMIT {limit}", conn.raw_conn
     )
     total_tx = pd.read_sql_query(
-        "SELECT COUNT(*) AS cnt FROM api_transactions", conn
+        "SELECT COUNT(*) AS cnt FROM api_transactions", conn.raw_conn
     )["cnt"].iloc[0]
     anomaly_df = pd.read_sql_query(
-        "SELECT * FROM anomaly_logs ORDER BY id DESC LIMIT 50", conn
+        "SELECT * FROM anomaly_logs ORDER BY id DESC LIMIT 50", conn.raw_conn
     )
     total_anomalies = pd.read_sql_query(
-        "SELECT COUNT(*) AS cnt FROM anomaly_logs", conn
+        "SELECT COUNT(*) AS cnt FROM anomaly_logs", conn.raw_conn
     )["cnt"].iloc[0]
     status_df = pd.read_sql_query(
-        "SELECT * FROM agent_status WHERE id = 1", conn
+        "SELECT * FROM agent_status WHERE id = 1", conn.raw_conn
     )
     conn.close()
     return tx_df, int(total_tx), anomaly_df, int(total_anomalies), status_df
@@ -46,14 +45,13 @@ def check_agent_health(status_df: pd.DataFrame):
     try:
         last_hb = datetime.strptime(last_hb_str, "%Y-%m-%d %H:%M:%S")
         age_sec = (datetime.now() - last_hb).total_seconds()
-        if db_status == "ONLINE" and age_sec <= 20:
+        if db_status == "ONLINE" and age_sec <= 30:
             return "ONLINE", f"Active ({int(age_sec)}s ago)"
         return "OFFLINE", f"Last seen {last_hb_str}"
     except Exception:
         return db_status, last_hb_str
 
 
-# ---------------- SIDEBAR CONTROLS ----------------
 st.sidebar.header("⚙️ Agent Configuration")
 z_threshold = st.sidebar.slider("Z-Score Anomaly Threshold", 1.5, 5.0, 2.8, 0.1)
 window_size = st.sidebar.slider("Rolling Baseline Window", 10, 100, 25, 5)
@@ -76,7 +74,6 @@ if col_b2.button("🐢 Heavy SQL"):
 
 if st.sidebar.button("🚨 Inject Simulated Spike", use_container_width=True):
     spike_ms = inject_simulated_spike()
-    # Immediately evaluate if standalone cloud mode is running without background worker
     tx_tmp, _, _, _, _ = fetch_dashboard_data(limit=window_size + 20)
     if not tx_tmp.empty:
         det = AnomalyDetector(z_threshold=z_threshold, window_size=window_size)
@@ -86,25 +83,23 @@ if st.sidebar.button("🚨 Inject Simulated Spike", use_container_width=True):
             AlertDispatcher().dispatch_anomalies(latest.to_dict(orient="records"))
     st.sidebar.error(f"Simulated spike injected: {spike_ms} ms")
 
-# ---------------- LOAD LIVE PERSISTENT DATA ----------------
 tx_df, total_tx, anomaly_df, total_anomalies, status_df = fetch_dashboard_data(limit=150)
 agent_state, heartbeat_info = check_agent_health(status_df)
 
-# ---------------- HEADER & SYSTEM STATUS ----------------
 st.title("📡 Autonomous Database Anomaly Monitor")
 st.caption(
-    "Persistent SQLite/Cloud DB telemetry with rolling Z-score baseline detection and automated alerting."
+    "Persistent SQLite/Cloud PostgreSQL telemetry with rolling Z-score baseline detection and automated alerting."
 )
 
+db_label = "Cloud PostgreSQL (24/7 Persistent)" if is_postgres() else "Local SQLite (app_data.db)"
 status_col1, status_col2, status_col3 = st.columns([2, 2, 3])
-status_col1.success("🟢 Database: Connected (app_data.db)")
+status_col1.success(f"🟢 Database: {db_label}")
 if agent_state == "ONLINE":
     status_col2.success(f"🤖 Agent Status: ONLINE ({heartbeat_info})")
 else:
     status_col2.warning(f"🟠 Agent Status: OFFLINE ({heartbeat_info})")
 status_col3.info(f"🕒 Dashboard Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# ---------------- KPI METRICS ----------------
 if not tx_df.empty:
     tx_sorted = tx_df.sort_values("id").reset_index(drop=True)
     if data_filter == "REAL_DB Only" and "source_type" in tx_sorted.columns:
@@ -125,7 +120,6 @@ if not tx_df.empty:
     m3.metric("Dynamic Rolling Baseline", f"{baseline_mean:.2f} ms")
     m4.metric("Total Persistent Anomalies", f"{total_anomalies:,}")
 
-    # ---------------- CHARTS ----------------
     st.subheader("📈 Real-Time Latency & Dynamic Rolling Baseline")
     if not evaluated_df.empty:
         chart_df = evaluated_df[["id", "response_time_ms", "rolling_mean"]].set_index("id")
@@ -139,7 +133,6 @@ else:
     evaluated_df = pd.DataFrame()
     st.info("No transaction records found yet. Start agent.py or click 'Run Real SQL' in the sidebar.")
 
-# ---------------- TABS: ALERTS, TRANSACTIONS, MANUAL/CSV, REPORT ----------------
 tab1, tab2, tab3 = st.tabs(
     ["🚨 Persistent Anomaly Alerts", "📋 Transaction History", "📥 Manual Entry & CSV Tools"]
 )
@@ -227,7 +220,7 @@ with tab3:
                 )
                 conn.commit()
                 conn.close()
-                st.success(f"Imported {len(rows)} rows into app_data.db!")
+                st.success(f"Imported {len(rows)} rows into database!")
             else:
                 st.error("CSV must contain columns: endpoint, response_time_ms, status_code")
 
@@ -240,7 +233,6 @@ with tab3:
                 mime="text/csv",
             )
 
-# ---------------- AUTO-REFRESH LOOP ----------------
 if auto_refresh:
     time.sleep(5)
     st.rerun()

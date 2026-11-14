@@ -1,9 +1,7 @@
 import time
 import random
-import sqlite3
 from datetime import datetime
 from init_db import get_connection, init_database
-
 
 REAL_WORKLOAD_QUERIES = [
     ("SQL_SELECT_RECENT_ORDERS", "SELECT * FROM sample_orders ORDER BY order_id DESC LIMIT 25"),
@@ -14,10 +12,6 @@ REAL_WORKLOAD_QUERIES = [
 
 
 def execute_real_db_query(simulate_heavy_load: bool = False):
-    """
-    Executes a genuine SQL query against the database, measures actual
-    execution time using perf_counter(), and records the real metric.
-    """
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -38,7 +32,7 @@ def execute_real_db_query(simulate_heavy_load: bool = False):
     try:
         cursor.execute(sql)
         _ = cursor.fetchall()
-    except sqlite3.Error as e:
+    except Exception as e:
         status_code = 500
         print(f"[DB Query Error] {operation_name}: {e}")
     elapsed_ms = round((time.perf_counter() - start_time) * 1000, 3)
@@ -65,7 +59,6 @@ def execute_real_db_query(simulate_heavy_load: bool = False):
 
 
 def inject_simulated_spike():
-    """Optional demo helper: inserts a simulated latency spike clearly labeled as SIMULATED."""
     conn = get_connection()
     cursor = conn.cursor()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -85,7 +78,6 @@ def inject_simulated_spike():
 
 if __name__ == "__main__":
     init_database()
-    print("Running 5 real SQL queries and measuring genuine execution times...\n")
     for _ in range(5):
         result = execute_real_db_query(simulate_heavy_load=False)
         print(f"Executed {result['endpoint']} -> {result['response_time_ms']} ms (Status {result['status_code']})")
