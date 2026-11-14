@@ -45,7 +45,7 @@ def check_agent_health(status_df: pd.DataFrame):
     try:
         last_hb = datetime.strptime(last_hb_str, "%Y-%m-%d %H:%M:%S")
         age_sec = (datetime.now() - last_hb).total_seconds()
-        if db_status == "ONLINE" and age_sec <= 30:
+        if db_status == "ONLINE" and age_sec <= 900:
             return "ONLINE", f"Active ({int(age_sec)}s ago)"
         return "OFFLINE", f"Last seen {last_hb_str}"
     except Exception:
