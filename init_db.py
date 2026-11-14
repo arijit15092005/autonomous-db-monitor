@@ -17,16 +17,17 @@ DB_PATH = "app_data.db"
 
 
 def get_database_url() -> str:
-    env_url = os.getenv("DATABASE_URL", "").strip()
-    if env_url:
-        return env_url
-    if st is not None:
+    raw_url = os.getenv("DATABASE_URL", "").strip()
+    if not raw_url and st is not None:
         try:
             if "DATABASE_URL" in st.secrets:
-                return str(st.secrets["DATABASE_URL"]).strip()
+                raw_url = str(st.secrets["DATABASE_URL"]).strip()
         except Exception:
             pass
-    return ""
+    if raw_url:
+        raw_url = raw_url.replace("psql ", "").strip("'\"")
+        raw_url = raw_url.replace("&channel_binding=require", "").replace("?channel_binding=require", "")
+    return raw_url
 
 
 def is_postgres() -> bool:
