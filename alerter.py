@@ -1,16 +1,17 @@
 import os
 import requests
 from datetime import datetime
-from init_db import get_connection, USE_POSTGRES
+from init_db import get_connection
 
 
 class AlertDispatcher:
     def __init__(self, webhook_url: str = None):
         self.webhook_url = (webhook_url or os.getenv("ALERT_WEBHOOK_URL", "")).strip()
 
-    def _get_anomaly_columns(self, cursor):
-        """Return anomaly_logs columns using PostgreSQL information_schema or SQLite PRAGMA."""
-        if USE_POSTGRES:
+    def _get_anomaly_columns(self, conn, cursor):
+        """Return anomaly_logs columns for PostgreSQL or SQLite without extra imports."""
+        is_postgres = "psycopg" in type(conn).__module__.lower() or "psycopg" in type(cursor).__module__.lower()
+        if is_postgres:
             cursor.execute(
                 """
                 SELECT column_name
@@ -29,7 +30,7 @@ class AlertDispatcher:
 
         conn = get_connection()
         cursor = conn.cursor()
-        existing_cols = self._get_anomaly_columns(cursor)
+        existing_cols = self._get_anomaly_columns(conn, cursor)
         saved_count = 0
 
         for item in anomalies:
