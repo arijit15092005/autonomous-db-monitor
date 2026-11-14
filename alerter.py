@@ -1,7 +1,7 @@
 import os
 import requests
 from datetime import datetime
-from init_db import get_connection
+from init_db import get_connection, USE_POSTGRES
 
 
 class AlertDispatcher:
@@ -9,20 +9,16 @@ class AlertDispatcher:
         self.webhook_url = (webhook_url or os.getenv("ALERT_WEBHOOK_URL", "")).strip()
 
     def _get_anomaly_columns(self, cursor):
-        """Inspect existing anomaly_logs columns in PostgreSQL or SQLite so inserts never break."""
-        try:
+        """Return anomaly_logs columns using PostgreSQL information_schema or SQLite PRAGMA."""
+        if USE_POSTGRES:
             cursor.execute(
                 """
                 SELECT column_name
                 FROM information_schema.columns
-                WHERE table_name = 'anomaly_logs'
+                WHERE table_schema = 'public' AND table_name = 'anomaly_logs'
                 """
             )
-            cols = [row[0] for row in cursor.fetchall()]
-            if cols:
-                return set(cols)
-        except Exception:
-            pass
+            return {row[0] for row in cursor.fetchall()}
 
         cursor.execute("PRAGMA table_info(anomaly_logs)")
         return {row[1] for row in cursor.fetchall()}
@@ -48,7 +44,6 @@ class AlertDispatcher:
                 f"{latency:.2f} ms (Z-Score: {z_score:.2f})"
             )
 
-            # Skip duplicate transaction_id safely in both PostgreSQL and SQLite
             if tx_id is not None and "transaction_id" in existing_cols:
                 cursor.execute(
                     "SELECT 1 FROM anomaly_logs WHERE transaction_id = ?",
@@ -110,6 +105,5 @@ class AlertDispatcher:
 
 
 def trigger_alerts(anomalies: list, webhook_url: str = None) -> int:
-    """Backward-compatible helper function if called directly."""
     dispatcher = AlertDispatcher(webhook_url=webhook_url)
     return dispatcher.dispatch_anomalies(anomalies)
