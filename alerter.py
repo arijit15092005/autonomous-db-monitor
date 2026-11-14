@@ -1,120 +1,105 @@
-import os
+﻿import os
 import requests
 from datetime import datetime
 from init_db import get_connection
 
+try:
+    from plyer import notification
+except Exception:
+    notification = None
+
 
 class AlertDispatcher:
-    def __init__(self, webhook_url: str = None):
-        self.webhook_url = (webhook_url or os.getenv("ALERT_WEBHOOK_URL", "")).strip()
+    def __init__(self):
+        # Optional secure credentials loaded from environment variables (never hardcoded)
+        self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    def _is_postgres(self) -> bool:
-        if os.getenv("DATABASE_URL", "").strip().startswith("postgres"):
-            return True
+    def notify_desktop(self, title: str, message: str):
+        if notification is None:
+            return
         try:
-            import streamlit as st
-            if "DATABASE_URL" in st.secrets:
-                return True
-        except Exception:
-            pass
-        return False
-
-    def _get_anomaly_columns(self, cursor):
-        """Return anomaly_logs column names cleanly for PostgreSQL or SQLite."""
-        if self._is_postgres():
-            cursor.execute(
-                """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_schema = 'public' AND table_name = 'anomaly_logs'
-                """
+            notification.notify(
+                title=title,
+                message=message,
+                app_name="Autonomous DB Monitor",
+                timeout=5,
             )
-            return {row[0] for row in cursor.fetchall()}
+        except Exception as e:
+            print(f"[Info] Desktop popup skipped (headless/cloud environment): {e}")
 
-        cursor.execute("PRAGMA table_info(anomaly_logs)")
-        return {row[1] for row in cursor.fetchall()}
+    def notify_telegram(self, message: str):
+        """Sends an optional Telegram alert if environment variables are configured."""
+        if not self.telegram_token or not self.telegram_chat_id:
+            return
+        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+        try:
+            requests.post(
+                url,
+                json={"chat_id": self.telegram_chat_id, "text": message},
+                timeout=5,
+            )
+        except Exception as e:
+            print(f"[Warning] Telegram alert failed: {e}")
 
-    def dispatch_anomalies(self, anomalies: list) -> int:
-        if not anomalies:
+    def dispatch_anomalies(self, anomaly_records: list) -> int:
+        """
+        Persists anomalies to anomaly_logs with deduplication (UNIQUE transaction_id)
+        and triggers notifications only for brand-new alerts.
+        """
+        if not anomaly_records:
             return 0
 
         conn = get_connection()
         cursor = conn.cursor()
-        existing_cols = self._get_anomaly_columns(cursor)
-        saved_count = 0
+        new_alerts_count = 0
 
-        for item in anomalies:
-            tx_id = item.get("id")
-            endpoint = str(item.get("endpoint", "UNKNOWN"))
-            latency = float(item.get("response_time_ms", 0.0))
-            z_score = float(item.get("z_score", 0.0))
-            severity = "CRITICAL" if abs(z_score) >= 4.0 else "HIGH"
+        for record in anomaly_records:
+            tx_id = int(record["id"])
             detected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            message = (
-                f"[{severity}] Latency spike on {endpoint}: "
-                f"{latency:.2f} ms (Z-Score: {z_score:.2f})"
+            severity = record.get("severity", "HIGH")
+            reason = record.get("reason", "Statistical latency anomaly")
+
+            cursor.execute(
+                """
+                INSERT INTO anomaly_logs
+                (transaction_id, endpoint, response_time_ms, status_code, z_score, severity, reason, detected_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (transaction_id) DO NOTHING
+                """,
+                (
+                    tx_id,
+                    record["endpoint"],
+                    float(record["response_time_ms"]),
+                    int(record["status_code"]),
+                    float(record["z_score"]),
+                    severity,
+                    reason,
+                    detected_at,
+                ),
             )
 
-            if tx_id is not None and "transaction_id" in existing_cols:
+            if cursor.rowcount > 0:
+                new_alerts_count += 1
                 cursor.execute(
-                    "SELECT 1 FROM anomaly_logs WHERE transaction_id = ?",
-                    (int(tx_id),),
+                    "UPDATE api_transactions SET alert_sent = 1 WHERE id = ?",
+                    (tx_id,),
                 )
-                if cursor.fetchone():
-                    continue
-
-            candidate_data = {
-                "transaction_id": int(tx_id) if tx_id is not None else None,
-                "endpoint": endpoint,
-                "response_time_ms": latency,
-                "z_score": z_score,
-                "severity": severity,
-                "message": message,
-                "detected_at": detected_at,
-                "timestamp": detected_at,
-                "created_at": detected_at,
-            }
-
-            cols_to_insert = [
-                col for col, val in candidate_data.items()
-                if col in existing_cols and val is not None
-            ]
-
-            if cols_to_insert:
-                placeholders = ", ".join(["?"] * len(cols_to_insert))
-                col_names = ", ".join(cols_to_insert)
-                values = tuple(candidate_data[col] for col in cols_to_insert)
-
-                cursor.execute(
-                    f"INSERT INTO anomaly_logs ({col_names}) VALUES ({placeholders})",
-                    values,
+                alert_msg = (
+                    f"[{severity}] DB Anomaly on {record['endpoint']} | "
+                    f"{record['response_time_ms']} ms (Z={record['z_score']}) | {reason}"
                 )
-                saved_count += 1
-
-            print(f"[ALERT DISPATCHED] {detected_at} | {message}")
-
-            if self.webhook_url:
-                try:
-                    requests.post(
-                        self.webhook_url,
-                        json={
-                            "text": message,
-                            "endpoint": endpoint,
-                            "response_time_ms": latency,
-                            "z_score": round(z_score, 2),
-                            "severity": severity,
-                            "detected_at": detected_at,
-                        },
-                        timeout=5,
-                    )
-                except Exception as webhook_err:
-                    print(f"[Warning] Webhook notification skipped: {webhook_err}")
+                print("=" * 60)
+                print(f"ðŸš¨ {alert_msg}")
+                print("=" * 60)
+                self.notify_telegram(f"ðŸš¨ {alert_msg}\nTime: {detected_at}")
 
         conn.commit()
         conn.close()
-        return saved_count
 
+        if new_alerts_count > 0:
+            self.notify_desktop(
+                "Autonomous DB Anomaly Alert",
+                f"{new_alerts_count} new database anomaly detected. Check dashboard.",
+            )
 
-def trigger_alerts(anomalies: list, webhook_url: str = None) -> int:
-    dispatcher = AlertDispatcher(webhook_url=webhook_url)
-    return dispatcher.dispatch_anomalies(anomalies)
+        return new_alerts_count
