@@ -1,40 +1,92 @@
-import sqlite3
-import random
 import time
+import random
+import sqlite3
+from datetime import datetime
+from init_db import get_connection, init_database
 
-DB_PATH = "app_data.db"
 
-def simulate_traffic():
-    print("[*] Simulating live incoming database traffic. Press Ctrl+C to stop...")
-    while True:
-        # 90% chance: normal latency (120ms - 180ms, HTTP 200)
-        # 10% chance: anomalous spike (600ms - 1200ms, HTTP 500/504)
-        is_spike = random.random() < 0.10
+REAL_WORKLOAD_QUERIES = [
+    ("SQL_SELECT_RECENT_ORDERS", "SELECT * FROM sample_orders ORDER BY order_id DESC LIMIT 25"),
+    ("SQL_AGGREGATE_BY_REGION", "SELECT region, COUNT(*), AVG(amount) FROM sample_orders GROUP BY region"),
+    ("SQL_FILTER_HIGH_VALUE", "SELECT customer_name, amount FROM sample_orders WHERE amount > 500"),
+    ("SQL_TRANSACTION_COUNT", "SELECT COUNT(*) FROM api_transactions"),
+]
 
-        if is_spike:
-            latency = round(random.uniform(650.0, 1200.0), 2)
-            status = random.choice([500, 502, 504])
-            endpoint = "/checkout"
-            print(f"[!] Generating anomalous spike: {latency}ms (Status: {status})")
-        else:
-            latency = round(random.gauss(150, 15), 2)
-            status = 200
-            endpoint = random.choice(["/home", "/search", "/items", "/checkout"])
 
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO api_transactions (endpoint, response_time_ms, status_code) VALUES (?, ?, ?)",
-                (endpoint, latency, status)
-            )
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            print(f"[Error] Failed to insert traffic record: {e}")
+def execute_real_db_query(simulate_heavy_load: bool = False):
+    """
+    Executes a genuine SQL query against the database, measures actual
+    execution time using perf_counter(), and records the real metric.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
 
-        # Push a new transaction every 1 to 2 seconds
-        time.sleep(random.uniform(1.0, 2.0))
+    if simulate_heavy_load:
+        operation_name = "SQL_HEAVY_CROSS_JOIN_SCAN"
+        sql = """
+            SELECT a.region, COUNT(*)
+            FROM sample_orders a
+            CROSS JOIN sample_orders b
+            WHERE a.amount > b.amount
+            GROUP BY a.region
+        """
+    else:
+        operation_name, sql = random.choice(REAL_WORKLOAD_QUERIES)
+
+    status_code = 200
+    start_time = time.perf_counter()
+    try:
+        cursor.execute(sql)
+        _ = cursor.fetchall()
+    except sqlite3.Error as e:
+        status_code = 500
+        print(f"[DB Query Error] {operation_name}: {e}")
+    elapsed_ms = round((time.perf_counter() - start_time) * 1000, 3)
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        """
+        INSERT INTO api_transactions
+        (endpoint, response_time_ms, status_code, timestamp, source_type)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (operation_name, elapsed_ms, status_code, now_str, "REAL_DB"),
+    )
+    conn.commit()
+    conn.close()
+
+    return {
+        "endpoint": operation_name,
+        "response_time_ms": elapsed_ms,
+        "status_code": status_code,
+        "timestamp": now_str,
+        "source_type": "REAL_DB",
+    }
+
+
+def inject_simulated_spike():
+    """Optional demo helper: inserts a simulated latency spike clearly labeled as SIMULATED."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    spike_ms = round(random.uniform(450.0, 750.0), 2)
+    cursor.execute(
+        """
+        INSERT INTO api_transactions
+        (endpoint, response_time_ms, status_code, timestamp, source_type)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("DEMO_SIMULATED_SPIKE", spike_ms, 504, now_str, "SIMULATED"),
+    )
+    conn.commit()
+    conn.close()
+    return spike_ms
+
 
 if __name__ == "__main__":
-    simulate_traffic()
+    init_database()
+    print("Running 5 real SQL queries and measuring genuine execution times...\n")
+    for _ in range(5):
+        result = execute_real_db_query(simulate_heavy_load=False)
+        print(f"Executed {result['endpoint']} -> {result['response_time_ms']} ms (Status {result['status_code']})")
+        time.sleep(0.5)

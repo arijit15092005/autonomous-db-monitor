@@ -1,58 +1,115 @@
-import sqlite3
 import time
+import sqlite3
 import pandas as pd
+from datetime import datetime
+from init_db import get_connection, init_database
 from detector import AnomalyDetector
 from alerter import AlertDispatcher
+from traffic_generator import execute_real_db_query
 
-DB_PATH = "app_data.db"
 POLL_INTERVAL_SECONDS = 5
+WINDOW_SIZE = 25
+Z_THRESHOLD = 2.8
 
-def run_agent():
-    detector = AnomalyDetector(z_threshold=2.8)
-    alerter = AlertDispatcher()
-    last_processed_id = 0
 
-    print(f"[*] Autonomous Database Agent running. Polling every {POLL_INTERVAL_SECONDS}s...")
-
-    conn = sqlite3.connect(DB_PATH)
+def get_last_processed_id() -> int:
+    conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT MAX(id) FROM api_transactions")
-    res = cursor.fetchone()[0]
-    last_processed_id = res if res else 0
+    cursor.execute("SELECT last_processed_id FROM agent_status WHERE id = 1")
+    row = cursor.fetchone()
+    conn.close()
+    return int(row["last_processed_id"]) if row else 0
+
+
+def update_heartbeat(status: str, last_processed_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        """
+        INSERT INTO agent_status (id, status, last_heartbeat, last_processed_id)
+        VALUES (1, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            status = excluded.status,
+            last_heartbeat = excluded.last_heartbeat,
+            last_processed_id = excluded.last_processed_id
+        """,
+        (status, now_str, last_processed_id),
+    )
+    conn.commit()
     conn.close()
 
-    while True:
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            window_df = pd.read_sql_query(
-                "SELECT * FROM api_transactions ORDER BY id DESC LIMIT 200", 
-                conn
-            )
-            new_records_df = pd.read_sql_query(
-                f"SELECT * FROM api_transactions WHERE id > {last_processed_id}",
-                conn
-            )
-            conn.close()
 
-            if not new_records_df.empty:
-                max_id = new_records_df["id"].max()
-                anomalies = detector.find_anomalies(window_df, "response_time_ms")
-                new_anomalies = anomalies[anomalies["id"].isin(new_records_df["id"])]
+def run_agent(auto_probe_db: bool = True):
+    init_database()
+    detector = AnomalyDetector(z_threshold=Z_THRESHOLD, window_size=WINDOW_SIZE)
+    alerter = AlertDispatcher()
 
-                if not new_anomalies.empty:
-                    records = new_anomalies.to_dict(orient="records")
-                    alerter.log_incident(records)
-                    alerter.notify_desktop(
-                        "Database Spike Detected",
-                        f"{len(records)} latency anomalies found."
-                    )
+    last_processed_id = get_last_processed_id()
+    print(f"[Agent] Started Autonomous Monitoring Agent (resuming from ID > {last_processed_id})")
+    print(f"[Agent] Polling interval: {POLL_INTERVAL_SECONDS}s | Z-Threshold: {Z_THRESHOLD}")
 
-                last_processed_id = max_id
+    try:
+        while True:
+            try:
+                # 1. Perform genuine SQL health probe so real DB metrics are continuously gathered
+                if auto_probe_db:
+                    execute_real_db_query(simulate_heavy_load=False)
 
-        except Exception as e:
-            print(f"[Error] Execution loop failure: {e}")
+                # 2. Fetch rolling window + all newly arrived transactions
+                conn = get_connection()
+                recent_df = pd.read_sql_query(
+                    f"""
+                    SELECT * FROM api_transactions
+                    ORDER BY id DESC LIMIT {WINDOW_SIZE + 50}
+                    """,
+                    conn,
+                )
 
-        time.sleep(POLL_INTERVAL_SECONDS)
+                if not recent_df.empty:
+                    recent_df = recent_df.sort_values("id").reset_index(drop=True)
+                    evaluated_df = detector.evaluate_transactions(recent_df, "response_time_ms")
+
+                    # Filter strictly to transactions not yet processed
+                    new_rows = evaluated_df[evaluated_df["id"] > last_processed_id]
+
+                    if not new_rows.empty:
+                        cursor = conn.cursor()
+                        for _, row in new_rows.iterrows():
+                            cursor.execute(
+                                """
+                                UPDATE api_transactions
+                                SET z_score = ?, is_anomaly = ?
+                                WHERE id = ?
+                                """,
+                                (float(row["z_score"]), int(row["is_anomaly"]), int(row["id"])),
+                            )
+                        conn.commit()
+
+                        anomalies = new_rows[new_rows["is_anomaly"] == 1]
+                        if not anomalies.empty:
+                            alerter.dispatch_anomalies(anomalies.to_dict(orient="records"))
+
+                        last_processed_id = int(new_rows["id"].max())
+                        print(
+                            f"[{datetime.now().strftime('%H:%M:%S')}] Processed {len(new_rows)} tx(s) | "
+                            f"Latest ID: {last_processed_id} | Anomalies in batch: {len(anomalies)}"
+                        )
+
+                conn.close()
+                update_heartbeat("ONLINE", last_processed_id)
+
+            except sqlite3.OperationalError as db_err:
+                print(f"[Warning] Temporary DB lock/connection issue, retrying safely: {db_err}")
+            except Exception as loop_err:
+                print(f"[Error] Monitoring cycle error: {loop_err}")
+
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+    except KeyboardInterrupt:
+        update_heartbeat("OFFLINE", last_processed_id)
+        print("\n[Agent] Stopped cleanly by user. Heartbeat set to OFFLINE.")
+
 
 if __name__ == "__main__":
-    run_agent()
+    run_agent(auto_probe_db=True)
