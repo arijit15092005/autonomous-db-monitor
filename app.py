@@ -1,7 +1,7 @@
 import time
 import pandas as pd
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, timezone
 from init_db import get_connection, init_database, is_postgres
 from detector import AnomalyDetector
 from alerter import AlertDispatcher
@@ -43,11 +43,12 @@ def check_agent_health(status_df: pd.DataFrame):
     db_status = status_df["status"].iloc[0]
     last_hb_str = status_df["last_heartbeat"].iloc[0]
     try:
-        last_hb = datetime.strptime(last_hb_str, "%Y-%m-%d %H:%M:%S")
-        age_sec = (datetime.now() - last_hb).total_seconds()
-        if db_status == "ONLINE" and age_sec <= 900:
+        # Fixed: Using UTC timezone and 2700s (45 mins) threshold to prevent false OFFLINE due to GitHub Actions queue delays
+        last_hb = datetime.strptime(last_hb_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        age_sec = max(0, (datetime.now(timezone.utc) - last_hb).total_seconds())
+        if db_status == "ONLINE" and age_sec <= 2700:
             return "ONLINE", f"Active ({int(age_sec)}s ago)"
-        return "OFFLINE", f"Last seen {last_hb_str}"
+        return "OFFLINE", f"Last seen {last_hb_str} (Age: {int(age_sec)}s)"
     except Exception:
         return db_status, last_hb_str
 
