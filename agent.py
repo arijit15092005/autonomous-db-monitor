@@ -18,7 +18,8 @@ def run_autonomous_agent(once: bool = False):
     while True:
         try:
             conn = get_connection()
-            print(f"[Agent] Connected. Using Cloud PostgreSQL: {is_postgres()}")
+            postgres_mode = is_postgres()
+            print(f"[Agent] Connected. Using Cloud PostgreSQL: {postgres_mode}")
             
             # Execute real telemetry check and log transaction
             res = execute_real_db_query(simulate_heavy_load=False)
@@ -27,18 +28,21 @@ def run_autonomous_agent(once: bool = False):
             # Update agent heartbeat in database with precise UTC timestamp
             now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             
+            # Use correct placeholder (%s for PostgreSQL, ? for SQLite)
+            ph = "%s" if postgres_mode else "?"
+            
             # Check if agent_status row exists, update or insert
             status_check = conn.execute("SELECT COUNT(*) FROM agent_status WHERE id = 1").fetchone()
-            if status_check and status_check[0] > 0:
-                conn.execute(
-                    "UPDATE agent_status SET status = ?, last_heartbeat = ? WHERE id = 1",
-                    ("ONLINE", now_str)
-                )
+            # Handle tuple or scalar return from different DB wrappers
+            count_val = status_check[0] if status_check else 0
+            
+            if count_val > 0:
+                query = f"UPDATE agent_status SET status = {ph}, last_heartbeat = {ph} WHERE id = 1"
+                conn.execute(query, ("ONLINE", now_str))
             else:
-                conn.execute(
-                    "INSERT INTO agent_status (id, status, last_heartbeat) VALUES (1, ?, ?)",
-                    ("ONLINE", now_str)
-                )
+                query = f"INSERT INTO agent_status (id, status, last_heartbeat) VALUES (1, {ph}, {ph})"
+                conn.execute(query, ("ONLINE", now_str))
+                
             conn.commit()
             conn.close()
             print(f"[Agent] Heartbeat successfully updated at {now_str} (UTC) -> Status: ONLINE")
